@@ -13,8 +13,14 @@
  */
 package org.switchyard.component.sca;
 
+import java.io.ByteArrayOutputStream;
+
+import javax.transaction.SystemException;
+import javax.transaction.Transaction;
 import javax.xml.namespace.QName;
 
+import org.jboss.jbossts.txbridge.outbound.OutboundBridge;
+import org.jboss.jbossts.txbridge.outbound.OutboundBridgeManager;
 import org.switchyard.Context;
 import org.switchyard.Exchange;
 import org.switchyard.ExchangePattern;
@@ -35,16 +41,31 @@ import org.switchyard.remote.cluster.LoadBalanceStrategy;
 import org.switchyard.remote.cluster.RandomStrategy;
 import org.switchyard.remote.cluster.RoundRobinStrategy;
 import org.switchyard.runtime.event.ExchangeCompletionEvent;
+import org.switchyard.serial.FormatType;
+import org.switchyard.serial.Serializer;
+import org.switchyard.serial.SerializerFactory;
+
+import com.arjuna.mw.wst.TxContext;
+import com.arjuna.mw.wst11.TransactionManagerFactory;
+import com.arjuna.mwlabs.wst11.at.context.TxContextImple;
+
+import org.oasis_open.docs.ws_tx.wscoor._2006._06.CoordinationContextType;
 
 /**
  * Handles outbound communication to an SCA service endpoint.
  */
 public class SCAInvoker extends BaseServiceHandler {
     
+    /**
+     * HTTP header used to communicate the transaction context to be propagated.
+     */
+    public static final String TRANSACTION_CONTEXT = "switchyard-transaction-context";
+
     private final SCABindingModel _config;
     private final String _bindingName;
     private final String _referenceName;
     private ClusteredInvoker _invoker;
+    private Serializer _serializer = SerializerFactory.create(FormatType.JSON, null, true);
     
     /**
      * Create a new SCAInvoker for invoking local endpoints.
@@ -134,12 +155,11 @@ public class SCAInvoker extends BaseServiceHandler {
             .setService(serviceName)
             .setContent(exchange.getMessage().getContent());
         exchange.getContext().mergeInto(request.getContext());
+        bridgeOutboundTransaction(request);
 
         try {
             RemoteMessage reply = _invoker.invoke(request);
-            if (reply == null) {
-                return;
-            }
+            bridgeInboundTransaction(reply);
             
             if (ExchangePattern.IN_OUT.equals(exchange.getPattern())) {
                 Message msg = exchange.createMessage();
@@ -171,6 +191,67 @@ public class SCAInvoker extends BaseServiceHandler {
         String targetName = _config.hasTarget() ? _config.getTarget() : service.getLocalPart();
         String targetNS = _config.hasTargetNamespace() ? _config.getTargetNamespace() : service.getNamespaceURI();
         return new QName(targetNS, targetName);
+    }
+    
+    private void bridgeOutboundTransaction(RemoteMessage request) throws HandlerException {
+        Transaction currentTransaction = null;
+        try {
+            currentTransaction = com.arjuna.ats.jta.TransactionManager.transactionManager().getTransaction();
+        } catch (SystemException e) {
+            // avoiding checkstyle error
+            e.getMessage();
+        }
+        if (currentTransaction == null) {
+            return;
+        }
+        
+        try {
+            // create/resume subordinate WS-AT transaction
+            OutboundBridge txOutboundBridge = OutboundBridgeManager.getOutboundBridge();
+            if (txOutboundBridge == null) {
+                return;
+            }
+            txOutboundBridge.start();
+            
+            // embed WS-AT transaction context into request header 
+            final com.arjuna.mw.wst11.TransactionManager wsatManager = TransactionManagerFactory.transactionManager();
+            CoordinationContextType coordinationContext = null;
+            if (wsatManager != null) {
+                final TxContextImple txContext = (TxContextImple)wsatManager.currentTransaction();
+                if (txContext != null) {
+                    coordinationContext = txContext.context().getCoordinationContext();
+                }
+            }
+
+            if (coordinationContext != null) {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                _serializer.serialize(coordinationContext, CoordinationContextType.class, baos);
+                request.setHeader(TRANSACTION_CONTEXT, new String(baos.toByteArray()));
+            }
+        } catch (final Throwable th) {
+            throw createHandlerException(th);
+        }
+    }
+    
+    private void bridgeInboundTransaction(RemoteMessage reply) throws HandlerException {
+        try {
+            String txContextHeader = reply.getHeader(TRANSACTION_CONTEXT);
+            if (txContextHeader != null) {
+                // extract WS-AT transaction context from response header and resume the transaction
+                final CoordinationContextType cc =
+                        _serializer.deserialize(txContextHeader.getBytes(), CoordinationContextType.class);
+                final TxContext txContext = new TxContextImple(cc);
+                TransactionManagerFactory.transactionManager().resume(txContext);
+
+                // disassociate subordinate WS-AT transaction
+                OutboundBridge txOutboundBridge = OutboundBridgeManager.getOutboundBridge();
+                if (txOutboundBridge != null) {
+                    txOutboundBridge.stop();
+                }
+            }
+        } catch (Throwable t) {
+            throw createHandlerException(t);
+        }
     }
     
     private HandlerException createHandlerException(Message message) {

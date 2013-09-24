@@ -14,6 +14,7 @@
  
 package org.switchyard.component.sca;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 
@@ -24,6 +25,9 @@ import javax.servlet.http.HttpServletResponse;
 import javax.xml.namespace.QName;
 
 import org.apache.log4j.Logger;
+import org.jboss.jbossts.txbridge.inbound.InboundBridge;
+import org.jboss.jbossts.txbridge.inbound.InboundBridgeManager;
+import org.oasis_open.docs.ws_tx.wscoor._2006._06.CoordinationContextType;
 import org.switchyard.Exchange;
 import org.switchyard.ExchangePattern;
 import org.switchyard.ExchangeState;
@@ -40,11 +44,18 @@ import org.switchyard.serial.FormatType;
 import org.switchyard.serial.Serializer;
 import org.switchyard.serial.SerializerFactory;
 
+import com.arjuna.mw.wst.TxContext;
+import com.arjuna.mw.wst11.TransactionManagerFactory;
+import com.arjuna.mwlabs.wst11.at.context.TxContextImple;
+
 /**
  * HTTP servlet which handles inbound remote communication for remote service endpoints.
  */
 public class SwitchYardRemotingServlet extends HttpServlet {
 
+    /** header name for the transaction context. */
+    public static final String TRANSACTION_CONTEXT = "switchyard-transaction-context";
+    
     private static final long serialVersionUID = 1L;
     private static Logger _log = Logger.getLogger(SwitchYardRemotingServlet.class);
     
@@ -56,6 +67,7 @@ public class SwitchYardRemotingServlet extends HttpServlet {
      */
     public void doPost(HttpServletRequest request, HttpServletResponse response) throws ServletException, IOException {
         ClassLoader setTCCL = null;
+        boolean transactionPropagated = false;
         
         try {
             // Grab the right service domain based on the service header
@@ -64,6 +76,8 @@ public class SwitchYardRemotingServlet extends HttpServlet {
             ClassLoader loader = (ClassLoader) domain.getProperty(Deployment.CLASSLOADER_PROPERTY);
             setTCCL = Classes.setTCCL(loader);
             
+            transactionPropagated = bridgeIncomingTransaction(request);
+
             RemoteMessage msg = _serializer.deserialize(request.getInputStream(), RemoteMessage.class);
             if (_log.isDebugEnabled()) {
                 _log.debug("Remote servlet received request for service " + msg.getService());
@@ -113,15 +127,66 @@ public class SwitchYardRemotingServlet extends HttpServlet {
             if (_log.isDebugEnabled()) {
                 _log.debug("Failed to process remote invocation", syEx);
             }
+
             RemoteMessage reply = new RemoteMessage();
             reply.setFault(true);
             reply.setContent(syEx);
             _serializer.serialize(reply, RemoteMessage.class, response.getOutputStream());
             response.getOutputStream().flush();
         } finally {
+            if (transactionPropagated) {
+                bridgeOutgoingTransaction(response);
+            }
+            
             if (setTCCL != null) {
                 Classes.setTCCL(setTCCL);
             }
+        }
+    }
+    
+    private boolean bridgeIncomingTransaction(HttpServletRequest request) {
+        try {
+            // extract WS-AT transaction context from response header and resume it
+            String txContextHeader = request.getHeader(TRANSACTION_CONTEXT);
+            if (txContextHeader != null) {
+                final CoordinationContextType cc =
+                        _serializer.deserialize(txContextHeader.getBytes(), CoordinationContextType.class);
+                final TxContext txContext = new TxContextImple(cc);
+                TransactionManagerFactory.transactionManager().resume(txContext);
+
+                // create or resume subordinate JTA transaction
+                InboundBridge txInboundBridge = InboundBridgeManager.getInboundBridge();
+                txInboundBridge.start();
+                return true;
+            } else {
+                return false;
+            }
+        } catch (Throwable t) {
+            throw new SwitchYardException(t);
+        }
+    }
+    
+    private void bridgeOutgoingTransaction(HttpServletResponse reply) {
+        try {
+            // disassociate subordinate JTA transaction
+            InboundBridge txInboundBridge = InboundBridgeManager.getInboundBridge();
+            txInboundBridge.stop();
+
+            // disassociate WS-AT transaction and embed its context into request header
+            final com.arjuna.mw.wst11.TransactionManager wsatManager = TransactionManagerFactory.transactionManager();
+            if (wsatManager != null) {
+                final TxContextImple txContext = (TxContextImple)wsatManager.currentTransaction();
+                CoordinationContextType coordinationContext = null;
+                if (txContext != null) {
+                    coordinationContext = txContext.context().getCoordinationContext();
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    _serializer.serialize(coordinationContext, CoordinationContextType.class, baos);
+                    reply.setHeader(TRANSACTION_CONTEXT, new String(baos.toByteArray()));
+                }
+                wsatManager.suspend();
+            }
+        } catch (final Throwable th) {
+            throw new SwitchYardException(th);
         }
     }
     
